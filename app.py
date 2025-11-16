@@ -1,227 +1,176 @@
 import streamlit as st
 import requests
-import numpy as np
 import pandas as pd
+import numpy as np
 import datetime as dt
+from zoneinfo import ZoneInfo
 import math
+import time
 
-st.set_page_config(page_title="Kalshi BTC Hourly EV (Mobile)", layout="centered")
+st.set_page_config(page_title="BTC Fair-Value Scanner", layout="centered")
 
-# ---------------------------------------------------
-# PRICE SOURCES (FREE)
-# ---------------------------------------------------
+# ----------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------
+EVENT_START_HOUR_EST = 9  # first event at 9am EST
+EVENT_END_HOUR_EST = 17   # last event at 5pm EST (5pm)
+STRIKE_SPACING = 250       # dollar spacing
+NUM_STRIKES_EACH_SIDE = 10 # number of strikes above/below ATM
 
-KRAKEN_TICKER = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
-COINGECKO_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-COINGECKO_MARKET_CHART = (
-    "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?"
-    "vs_currency=usd&days=1&interval=minutely"
-)
+# ----------------------------------------------------------
+# AUTO-REFRESH TOGGLE
+# ----------------------------------------------------------
+refresh = st.sidebar.checkbox("Auto-refresh (5s)", value=True)
 
-def fetch_btc_price_kraken_index():
-    """Free CF-derived BTC index via Kraken."""
-    r = requests.get(KRAKEN_TICKER, timeout=8)
-    r.raise_for_status()
-    data = r.json()
-    result = data["result"]
-    key = list(result.keys())[0]  # usually XXBTZUSD
-    last_trade = result[key]["c"][0]
-    return float(last_trade)
+if refresh:
+    st.experimental_set_query_params(ts=int(time.time()))
+    time.sleep(5)
+    st.experimental_rerun()
 
-def fetch_btc_price_coingecko():
-    """Fallback BTC price."""
-    r = requests.get(COINGECKO_PRICE, timeout=8)
-    r.raise_for_status()
-    return r.json()["bitcoin"]["usd"]
-
-def fetch_current_btc_price():
-    """DEFAULT: Kraken index (CF-like). FALLBACK: CoinGecko."""
+# ----------------------------------------------------------
+# FETCH BTC PRICE (KRAKEN INDEX – CF STYLE)
+# ----------------------------------------------------------
+def fetch_btc_spot():
+    url = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
     try:
-        return fetch_btc_price_kraken_index(), "Kraken Index (CF-derived)"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        key = list(data["result"].keys())[0]
+        price = float(data["result"][key]["c"][0])
+        return price
     except:
-        try:
-            price = fetch_btc_price_coingecko()
-            return price, "CoinGecko (fallback)"
-        except:
-            return None, "Error fetching price"
-
-def fetch_minute_prices_last_n(n_minutes=240):
-    """Minute-level BTC data from CoinGecko."""
-    r = requests.get(COINGECKO_MARKET_CHART, timeout=10)
-    r.raise_for_status()
-    raw = r.json().get("prices", [])
-    if not raw:
-        return pd.DataFrame()
-    df = pd.DataFrame(raw, columns=["ts_ms", "price"])
-    df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms")
-    df = df.drop_duplicates(subset="ts").sort_values("ts")
-    return df.tail(n_minutes)
-
-def realized_log_sigma_per_minute(prices_series):
-    """Volatility estimate from log returns."""
-    p = np.array(prices_series)
-    if len(p) < 2:
         return None
-    logr = np.log(p[1:] / p[:-1])
-    return float(np.std(logr, ddof=1))
 
-def prob_price_above_strike_log_normal(S0, K, sigma_log_per_minute, minutes_remaining):
-    """Probability BTC ends above strike (log-normal model)."""
-    if minutes_remaining <= 0:
+# ----------------------------------------------------------
+# FETCH VOLATILITY (KRAKEN 1-MIN OHLC)
+# ----------------------------------------------------------
+def fetch_kraken_ohlc(n_minutes=240):
+    url = f"https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1"
+    try:
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        raw = r.json()["result"]
+        key = list(raw.keys())[0]
+        df = pd.DataFrame(raw[key], columns=[
+            "time","open","high","low","close","vwap","volume","count"
+        ])
+        df["close"] = df["close"].astype(float)
+        df = df.tail(n_minutes)
+        return df
+    except:
+        return None
+
+def compute_sigma_per_minute(df):
+    closes = df["close"].values
+    if len(closes) < 2:
+        return 0.0008
+    logs = np.log(closes[1:] / closes[:-1])
+    sigma = np.std(logs, ddof=1)
+    return max(sigma, 1e-6)
+
+# ----------------------------------------------------------
+# NEXT EVENT DETECTOR (HOURLY, STARTING 9AM EST)
+# ----------------------------------------------------------
+def get_next_event_time():
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    now_est = now_utc.astimezone(ZoneInfo("America/New_York"))
+
+    today_est = now_est.date()
+    for hour in range(EVENT_START_HOUR_EST, EVENT_END_HOUR_EST + 1):
+        event_time_est = dt.datetime(
+            today_est.year, today_est.month, today_est.day,
+            hour, 0, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        if event_time_est > now_est:
+            return event_time_est
+
+    # If past last event → use tomorrow's 9am
+    tomorrow = today_est + dt.timedelta(days=1)
+    return dt.datetime(
+        tomorrow.year, tomorrow.month, tomorrow.day,
+        EVENT_START_HOUR_EST, 0, 0,
+        tzinfo=ZoneInfo("America/New_York")
+    )
+
+# ----------------------------------------------------------
+# PROBABILITY CALCULATION (LOG-NORMAL MODEL)
+# ----------------------------------------------------------
+def prob_price_above(S0, K, sigma_per_minute, minutes_left):
+    if minutes_left <= 0:
         return 1.0 if S0 > K else 0.0
-
-    sigma_T = sigma_log_per_minute * math.sqrt(minutes_remaining)
+    sigma_T = sigma_per_minute * math.sqrt(minutes_left)
     if sigma_T <= 0:
         return 1.0 if S0 > K else 0.0
-
     z = (math.log(K) - math.log(S0)) / sigma_T
-    from math import erf, sqrt
-    Phi = 0.5 * (1 + erf(z / math.sqrt(2)))  
-    return max(0.0, min(1.0, 1 - Phi))
+    Phi = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    return 1 - Phi
 
-def human_pct(x):
-    return f"{100*x:.2f}%"
+# ----------------------------------------------------------
+# UI HEADER
+# ----------------------------------------------------------
+st.title("🔍 BTC Fair-Value Strike Scanner")
+st.caption("Fully automatic • CF-style Kraken Index • iPhone optimized")
 
+# ----------------------------------------------------------
+# GET BTC SPOT + VOLATILITY
+# ----------------------------------------------------------
+spot = fetch_btc_spot()
+if spot is None:
+    st.error("Could not fetch BTC price.")
+    st.stop()
 
-# ---------------------------------------------------
-# UI
-# ---------------------------------------------------
+df_ohlc = fetch_kraken_ohlc(240)
+if df_ohlc is None:
+    st.error("Could not fetch Kraken OHLC.")
+    st.stop()
 
-st.title("Kalshi BTC Hourly – EV Helper")
-st.caption("CF-derived price (Kraken) • Mobile-optimized • Free data only")
+sigma = compute_sigma_per_minute(df_ohlc)
 
-col1, col2 = st.columns([2,1])
+# ----------------------------------------------------------
+# EVENT TIME + MINUTES REMAINING
+# ----------------------------------------------------------
+event_est = get_next_event_time()
+event_utc = event_est.astimezone(dt.timezone.utc)
+now_utc = dt.datetime.now(dt.timezone.utc)
+minutes_left = max(0, int((event_utc - now_utc).total_seconds() // 60))
 
-with col1:
-    strike = st.number_input(
-        "Kalshi Strike (BTC above this at hour end?)",
-        value=96500.0,
-        step=50.0,
-        format="%.2f"
-    )
-    minutes_for_vol = st.slider(
-        "Use last N minutes to estimate volatility:",
-        min_value=30,
-        max_value=1440,
-        value=240,
-        step=30
-    )
-    ev_threshold = st.number_input(
-        "EV threshold to recommend BUY (decimal)",
-        value=0.02,
-        step=0.01,
-        format="%.2f"
-    )
+# ----------------------------------------------------------
+# GENERATE STRIKE LIST AUTOMATICALLY
+# ----------------------------------------------------------
+atm = round(spot / STRIKE_SPACING) * STRIKE_SPACING
+strikes = [atm + i * STRIKE_SPACING for i in range(-NUM_STRIKES_EACH_SIDE, NUM_STRIKES_EACH_SIDE + 1)]
 
-with col2:
-    kalshi_price = st.number_input(
-        "Kalshi YES price (0–1)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.40,
-        step=0.01,
-        format="%.4f"
-    )
+# ----------------------------------------------------------
+# CALCULATE FAIR VALUES
+# ----------------------------------------------------------
+rows = []
+for K in strikes:
+    win = prob_price_above(spot, K, sigma, minutes_left)
+    fair_yes = win
+    rows.append([K, fair_yes, win])
 
-# ---------------------------------------------------
-# TIME UNTIL HOURLY SETTLEMENT (FIXED)
-# ---------------------------------------------------
+df = pd.DataFrame(rows, columns=["Strike", "Fair_Yes", "Win_Prob"])
+df = df.sort_values("Fair_Yes", ascending=False)
 
-now = dt.datetime.utcnow()
-hour_start = now.replace(minute=0, second=0, microsecond=0)
-hour_end = hour_start + dt.timedelta(hours=1)
-minutes_remaining = int((hour_end - now).total_seconds() // 60)
-minutes_remaining = max(0, minutes_remaining)
+# ----------------------------------------------------------
+# BEST STRIKE SECTION
+# ----------------------------------------------------------
+best = df.iloc[0]
 
-st.markdown("---")
-
-# ---------------------------------------------------
-# FETCH BTC PRICE
-# ---------------------------------------------------
-
-status_box = st.empty()
-btc_price, source = fetch_current_btc_price()
-
-if btc_price is None:
-    status_box.error("Error fetching BTC price.")
-else:
-    status_box.info(
-        f"BTC from {source}: ${btc_price:,.0f} • UTC {now.strftime('%H:%M')}"
-    )
-
-# ---------------------------------------------------
-# VOLATILITY
-# ---------------------------------------------------
-
-sigma = None
-try:
-    df_min = fetch_minute_prices_last_n(minutes_for_vol)
-    if not df_min.empty:
-        sigma = realized_log_sigma_per_minute(df_min["price"].values)
-except Exception as e:
-    st.warning(f"Could not fetch minute price series: {e}")
-
-if sigma is None or sigma == 0:
-    sigma = 0.0008  # fallback volatility
-
-# ---------------------------------------------------
-# WIN PROBABILITY + EV
-# ---------------------------------------------------
-
-win_prob = prob_price_above_strike_log_normal(
-    S0=btc_price if btc_price else strike,
-    K=strike,
-    sigma_log_per_minute=sigma,
-    minutes_remaining=minutes_remaining
-)
-
-ev = win_prob - kalshi_price
-no_win_prob = 1 - win_prob
-no_price = 1 - kalshi_price
-no_ev = no_win_prob - no_price
-
-# ---------------------------------------------------
-# DISPLAY SNAPSHOT (MOBILE)
-# ---------------------------------------------------
-
-st.markdown("## Live Snapshot")
-cA, cB = st.columns(2)
-
-with cA:
-    st.metric("BTC price", f"${btc_price:,.2f}" if btc_price else "—")
-    st.metric("Strike", f"${strike:,.2f}")
-    st.metric("Minutes left", f"{minutes_remaining} min")
-
-with cB:
-    st.metric("Win prob (model)", human_pct(win_prob))
-    st.metric("Implied prob", human_pct(kalshi_price))
-    st.metric("EV (YES)", f"{ev:.4f}")
+st.subheader("⭐ Best Strike Right Now")
+st.metric("Strike", f"${best['Strike']:,}")
+st.metric("Fair YES Price", f"{best['Fair_Yes']:.3f}")
+st.metric("Win Probability", f"{best['Win_Prob']*100:.1f}%")
+st.metric("Minutes to Settle", minutes_left)
 
 st.markdown("---")
 
-# ---------------------------------------------------
-# RECOMMENDATION
-# ---------------------------------------------------
-
-if ev >= ev_threshold:
-    rec = "BUY YES"
-    emoji = "✅"
-elif no_ev >= ev_threshold:
-    rec = "BUY NO"
-    emoji = "🔻"
-else:
-    rec = "WAIT"
-    emoji = "⏳"
-
-st.markdown(f"### Recommendation: {emoji} **{rec}**")
-st.write(f"- YES win probability: **{human_pct(win_prob)}**")
-st.write(f"- YES price: **{kalshi_price:.3f}**")
-st.write(f"- EV(YES): **{ev:.4f}**")
-st.write(f"- EV(NO): **{no_ev:.4f}**")
-st.write(f"- ROI if YES wins: **{(1-kalshi_price)/kalshi_price:.2f}×**")
+# ----------------------------------------------------------
+# TABLE (Top 15)
+# ----------------------------------------------------------
+st.subheader("Top 15 Strikes (Fair Values)")
+st.dataframe(df.head(15), use_container_width=True)
 
 st.markdown("---")
-st.caption("Tip: Safari → Share → Add to Home Screen for app-like usage.")
-
-if st.button("Refresh now"):
-    st.experimental_rerun()
+st.caption("Compare Fair YES to Kalshi YES for instant opportunities.")
